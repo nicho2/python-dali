@@ -20,8 +20,20 @@ import dali.command
 import dali.gear
 from dali.gear.general import EnableDeviceType
 
+import sys
+
+PLATFORM = 'LINUX'
+if sys.platform == 'win32':
+    import pywinusb.hid as wHid
+    print("platform windows")
+    PLATFORM = 'WIN32'
+
+if sys.version_info[0]==3 and sys.version_info[1] >= 8 and sys.platform.startswith('win'):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy()) # pour add_reader
+
 def _hex(b):
     return ''.join("%02X" % x for x in b)
+
 
 class _callback:
     """Helper class for callback registration
@@ -65,6 +77,11 @@ class hid:
         self._glob = glob
         self.dev_inst_map = dev_inst_map
         self._f = None
+        # if PLATFORM == 'WIN32':
+        #     vendor_id = 0x17b5
+        #     product_id = 0x0020
+        #     self.winhid_device = wHid.HidDeviceFilter(vendor_id=vendor_id,product_id=product_id).get_devices()[0]
+        #     self._log.debug("instancied: {}".format(self.winhid_device))
 
         # Should the send() method raise an exception if there is a
         # problem communicating with the underlying device, or should
@@ -124,11 +141,26 @@ class hid:
         else:
             path = [self._path]
         ex = None
+        if PLATFORM == 'WIN32':
+            path = [self._path]
         if path:
             try:
                 if self._glob:
                     self._log.debug("trying concrete path %s", path[0])
-                self._f = os.open(path[0], os.O_RDWR | os.O_NONBLOCK)
+                if PLATFORM == 'LINUX':
+                    self._f = os.open(path[0], os.O_RDWR | os.O_NONBLOCK)
+                else:
+                    from socket import socketpair
+                    self.win_rsock, self.win_wsock = socketpair() # rsock et wsock sont connectés par defaut
+                    vendor_id = 0x17b5
+                    product_id = 0x0020
+                    self.winhid_device = wHid.HidDeviceFilter(vendor_id=vendor_id, product_id=product_id).get_devices()[
+                        0]
+                    self._log.debug("instancied: {}".format(self.winhid_device))
+                    self.winhid_device.open()
+                    self.winhid_device.set_raw_data_handler(self._win_handler)
+                    self._f = self.winhid_device.device_path
+                    self._log.debug("open windows hid")
             except Exception as e:
                 self._f = None
                 ex = e
@@ -136,13 +168,16 @@ class hid:
             self._log.debug("path %s not found", self._path)
         if not self._f:
             # It didn't work.  Schedule a reconnection attempt if we can.
-            self._log.debug("hid failed to open %s (%s) - waiting to try again", self._path, ex)
+            self._log.debug("hid failed to open %s  (%s) - waiting to try again", self._path, ex)
             self._reconnect_task = asyncio.create_task(self._reconnect())
             return False
         self._reconnect_count = 0
         self._initialise_device()
         self._log.debug("hid opened %s", path[0])
-        asyncio.get_running_loop().add_reader(self._f, self._reader)
+        if PLATFORM == 'WIN32':
+            asyncio.get_running_loop().add_reader(self.win_rsock, self._reader)
+        else:
+            asyncio.get_running_loop().add_reader(self._f, self._reader)
         self.connection_status_callback._invoke("connected")
         return True
 
@@ -165,8 +200,14 @@ class hid:
             self._reconnect_task.cancel()
             self._reconnect_task = None
         if self._f:
-            asyncio.get_running_loop().remove_reader(self._f)
-            os.close(self._f)
+            if PLATFORM == 'WIN32':
+                asyncio.get_running_loop().remove_reader(self.win_rsock)
+                self.winhid_device.close()
+                #self.win_rsock.close()
+                #self.win_wsock.close()
+            else:
+                asyncio.get_running_loop().remove_reader(self._f)
+                os.close(self._f)
         self._shutdown_device()
         self._f = None
         self.connected.clear()
@@ -277,7 +318,10 @@ class hid:
     def _reader(self):
         try:
             # No need to retry on InterruptedError since 3.5
-            data = os.read(self._f, 64)
+            if PLATFORM == "WIN32":
+                data = self.win_rsock.recv(65)[1:]  # on retire le 1er octet
+            else:
+                data = os.read(self._f, 64)
         except OSError:
             # Device has gone away
             data = b''
@@ -288,6 +332,15 @@ class hid:
 
     def _handle_read(self, data):
         pass
+
+    def _win_handler(self,data):
+        """
+        reçoit les données de la passerelle et les ajoute à une liste
+        :param data:
+        :return:
+        """
+        self._log.debug("HID Raw data: {0}".format(data))
+        self.win_wsock.send(bytes(data.data))
 
 class tridonic(hid):
     # Commands sent to the interface
@@ -386,8 +439,14 @@ class tridonic(hid):
 
     def _initialise_device(self):
         # Read firmware version; pick up the reply in _handle_read
-        os.write(self._f, self._cmd(
-            tridonic._CMD_INIT, tridonic._CMD_INIT_READVERSION))
+        if PLATFORM == 'WIN32':
+            self._log.debug("cmd : {}".format(b'\x00' + self._cmd(
+                tridonic._CMD_INIT, tridonic._CMD_INIT_READVERSION) ))
+            self.winhid_device.send_output_report(b'\x00' + self._cmd(
+                tridonic._CMD_INIT, tridonic._CMD_INIT_READVERSION))
+        else:
+            os.write(self._f, self._cmd(
+                tridonic._CMD_INIT, tridonic._CMD_INIT_READVERSION))
 
     async def _power_supply(self, supply_on):
         await self.connected.wait()
@@ -427,7 +486,11 @@ class tridonic(hid):
                 else self._SEND_MODE_DALI24,
                 frame=frame.pack_len(4))
             try:
-                os.write(self._f, data)
+                if PLATFORM == 'WIN32':
+                    self._log.debug("cmd : {}".format(data))
+                    self.winhid_device.send_output_report(b'\x00' + data)
+                else:
+                    os.write(self._f, data)
             except OSError:
                 # The device has failed.  Disconnect, schedule a
                 # reconnection, and report this command as failed.
@@ -438,8 +501,7 @@ class tridonic(hid):
             outstanding_transmissions = 2 if command.sendtwice else 1
             response = None
             while outstanding_transmissions or response is None:
-                self._log.debug(f"waiting for {outstanding_transmissions=} "
-                                "{response=}")
+                self._log.debug(f"waiting for {outstanding_transmissions=} {response=}")
                 if len(messages) == 0:
                     await event.wait()
                     event.clear()
@@ -549,7 +611,7 @@ class tridonic(hid):
                             current_command = None
                             continue
                         else:
-                            self._log.debug("Failed config command (second frame didn't match): %s", current_comment)
+                            self._log.debug("Failed config command (second frame didn't match): %s", current_command)
                             self.bus_traffic._invoke(current_command, None, True)
                             current_command = None
                             # Fall through to continue processing frame
@@ -609,7 +671,7 @@ class tridonic(hid):
                     self._log.debug("remembering device type %s", devicetype)
             elif isinstance(frame, dali.frame.BackwardFrame):
                 self._log.debug("Unexpected backward frame %s", frame)
-            # self._log.debug("End of loop")
+        self._log.debug("End of loop")
 
     def _handle_read(self, data):
         self._log.debug("_handle_read %s", _hex(data[0:9]))
@@ -618,8 +680,12 @@ class tridonic(hid):
             if not self.firmware_version:
                 self.firmware_version = f"{data[3]}.{data[4]}"
                 # Now read the serial number
-                os.write(self._f, self._cmd(
-                    tridonic._CMD_INIT, tridonic._CMD_INIT_READSERIAL))
+                cmd = self._cmd(tridonic._CMD_INIT, tridonic._CMD_INIT_READSERIAL)
+                if PLATFORM == 'WIN32':
+                    self._log.debug("cmd : {}".format(cmd))
+                    self.winhid_device.send_output_report(b'\x00' + cmd)
+                else:
+                    os.write(self._f, cmd)
             elif not self.serial:
                 self.serial = _hex(data[1:5])
                 self.connected.set()
@@ -753,3 +819,7 @@ class hasseb(hid):
         # If there's a command in progress, tell it it's failed
         self._response = "fail"
         self._response_available.set()
+
+
+
+

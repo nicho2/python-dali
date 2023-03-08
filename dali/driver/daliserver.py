@@ -62,7 +62,12 @@ class DaliServer:
             if not self._s:
                 s.close()
 
-        response = self.unpack_response(command, result)
+        status = 2
+        while 1:  # réponse de type observe ignoré
+            response, status = self.unpack_response(command, result)
+            if status != 2:
+                break
+            result = s.recv(4)
 
         if response:
             logging.info("  -> {0}".format(response))
@@ -88,6 +93,8 @@ class DaliServer:
                 response = command.response(None)
             elif status == 1:
                 response = command.response(dali.frame.BackwardFrame(rval))
+            elif status == 2:
+                pass
             elif status == 255:
                 # This is "failure" - daliserver seems to be reporting
                 # this for a garbled response when several ballasts
@@ -96,6 +103,7 @@ class DaliServer:
             else:
                 raise CommunicationError("status was %d" % status)
 
-        return response
+        return response, status
+
 
 __all__ = ["DaliServer"]
